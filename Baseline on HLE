@@ -1,0 +1,176 @@
+import pandas as pd
+import numpy as np
+import warnings
+warnings.filterwarnings('ignore')
+
+
+# ============================================================================
+# 数据加载与预处理（支持 Parquet 和 JSONL，缺失值填 0）
+# ============================================================================
+def flatten_to_float_list(raw):
+    """将 Parquet 中的嵌套列表拉平为 float 列表，缺失值填 0.0"""
+    flat = []
+    if isinstance(raw, (np.ndarray, list)):
+        for item in raw:
+            flat.extend(flatten_to_float_list(item))
+    else:
+        if pd.notna(raw) and raw is not None:
+            try:
+                flat.append(float(raw))
+            except (ValueError, TypeError):
+                flat.append(0.0)
+    return flat
+
+
+def global_minmax_normalize(all_matrices):
+    """
+    全局 min‑max 归一化到 [-1, 1]（论文 Appendix A.2 要求实数值在 [-1,1]）
+    所有问题的同一验证器共享全局 min 和 max。
+    """
+    if not all_matrices:
+        return []
+    m = all_matrices[0].shape[1]
+    all_scores = [[] for _ in range(m)]
+    for mat in all_matrices:
+        for j in range(m):
+            all_scores[j].extend(mat[:, j].flatten())
+    global_min = np.zeros(m)
+    global_max = np.zeros(m)
+    for j in range(m):
+        arr = np.array(all_scores[j])
+        global_min[j] = np.min(arr)
+        global_max[j] = np.max(arr)
+    norm_list = []
+    for mat in all_matrices:
+        mat_norm = np.zeros_like(mat)
+        for j in range(m):
+            col = mat[:, j]
+            vmin, vmax = global_min[j], global_max[j]
+            rng = vmax - vmin
+            if rng < 1e-12:
+                rng = 1.0
+            mat_norm[:, j] = 2.0 * (col - vmin) / rng - 1.0
+        norm_list.append(np.nan_to_num(mat_norm, nan=0.0, posinf=1.0, neginf=-1.0))
+    return norm_list
+
+
+def tie_breaking_accuracy(scores, labels):
+    """平局处理：返回正确响应的比例"""
+    best = np.max(scores)
+    tied = np.where(np.abs(scores - best) < 1e-6)[0]
+    return np.mean(labels[tied])
+
+
+def run_baseline(data_path, dataset_name, verbose_questions=5):
+    """
+    仅计算 Pass@1 和 Naive Ensemble，不运行 FUSE
+    """
+    print("\n" + "=" * 80)
+    print(f"Baseline on {dataset_name} (Pass@1 and Naive Ensemble)")
+    print("=" * 80)
+
+    # ---------------------------- 数据加载 ---------------------------------
+    raw_matrices = []
+    all_labels = []
+
+    if data_path.endswith('.parquet'):
+        # ----- 处理 IMO 风格的 Parquet 文件 -----
+        df = pd.read_parquet(data_path)
+        verifier_cols = [c for c in df.columns if c.endswith('_scores')]
+        m = len(verifier_cols)
+        print(f"Found {m} verifiers: {verifier_cols}")
+        for _, row in df.iterrows():
+            labels = flatten_to_float_list(row['is_correct'])
+            labels = np.array([bool(x) for x in labels], dtype=bool)
+            if len(labels) == 0:
+                continue
+            n = len(labels)
+            mat = np.zeros((n, m))
+            for j, col in enumerate(verifier_cols):
+                scores = flatten_to_float_list(row[col])
+                for i in range(min(n, len(scores))):
+                    mat[i, j] = scores[i]
+            raw_matrices.append(mat)
+            all_labels.append(labels)
+
+    elif data_path.endswith('.jsonl'):
+        # ----- 处理 HLE 风格的 JSONL 文件（作者开源格式）-----
+        import json
+        verifier_names = None
+        with open(data_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                obj = json.loads(line)
+                if 'is_correct' not in obj:
+                    continue
+                labels = obj['is_correct']
+                labels = np.array([bool(x) for x in labels], dtype=bool)
+                if len(labels) == 0:
+                    continue
+
+                score_cols = [k for k in obj.keys() if k.endswith('_scores')]
+                score_cols.sort()
+                if verifier_names is None:
+                    verifier_names = score_cols
+                    m = len(verifier_names)
+                    print(f"Found {m} verifiers: {verifier_names}")
+                else:
+                    # 确保所有问题的列顺序一致
+                    assert score_cols == verifier_names, "Verifier order mismatch"
+                n = len(labels)
+                mat = np.zeros((n, m))
+                for j, col in enumerate(verifier_names):
+                    scores_raw = obj[col]
+                    for i in range(n):
+                        if i < len(scores_raw):
+                            val = scores_raw[i]
+                            if isinstance(val, list):
+                                val = val[0] if len(val) > 0 else 0.0
+                            if val is None:
+                                val = 0.0
+                            try:
+                                mat[i, j] = float(val)
+                            except (ValueError, TypeError):
+                                mat[i, j] = 0.0
+                        else:
+                            mat[i, j] = 0.0
+                raw_matrices.append(mat)
+                all_labels.append(labels)
+        print(f"Loaded {len(raw_matrices)} questions from JSONL")
+
+    else:
+        raise ValueError("Unsupported file format; use .parquet or .jsonl")
+
+    # ---------------------------- 全局归一化 --------------------------------
+    norm_matrices = global_minmax_normalize(raw_matrices)
+    total_qs = len(norm_matrices)
+
+    # ---------------------------- 评估 Baseline --------------------------------
+    pass1_correct = 0.0
+    naive_correct = 0.0
+
+    for qid, (V, labels) in enumerate(zip(norm_matrices, all_labels)):
+        N, m = V.shape
+
+        # Pass@1
+        pass1_correct += labels[0] if len(labels) > 0 else 0.0
+
+        # Naive Ensemble
+        naive_scores = np.mean(V, axis=1)
+        naive_correct += tie_breaking_accuracy(naive_scores, labels)
+
+        if qid < verbose_questions:
+            print(f"Q{qid}: Pass@1={labels[0]}, Naive={tie_breaking_accuracy(naive_scores, labels):.3f}")
+
+    total = total_qs
+    print("\n" + "-" * 80)
+    print(f"Final results on {dataset_name} (total = {total} questions):")
+    print(f"  Pass@1:         {pass1_correct / total * 100:.2f}%")
+    print(f"  Naive Ensemble: {naive_correct / total * 100:.2f}%")
+    print("=" * 80)
+
+
+# ============================================================================
+# 执行入口
+# ============================================================================
+if __name__ == "__main__":
+    run_baseline('FUSE-hle-data.jsonl', "Humanity's Last Exam")
