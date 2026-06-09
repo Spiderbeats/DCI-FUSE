@@ -1,0 +1,113 @@
+import pandas as pd
+import numpy as np
+from sklearn.linear_model import LogisticRegression
+import warnings
+warnings.filterwarnings('ignore')
+
+
+# ============================================================================
+# 数据加载与预处理（与之前一致）
+# ============================================================================
+def flatten_to_float_list(raw):
+    flat = []
+    if isinstance(raw, (np.ndarray, list)):
+        for item in raw:
+            flat.extend(flatten_to_float_list(item))
+    else:
+        if pd.notna(raw) and raw is not None:
+            try:
+                flat.append(float(raw))
+            except (ValueError, TypeError):
+                flat.append(0.0)
+    return flat
+
+
+def global_minmax_normalize(all_matrices):
+    if not all_matrices:
+        return []
+    m = all_matrices[0].shape[1]
+    all_scores = [[] for _ in range(m)]
+    for mat in all_matrices:
+        for j in range(m):
+            all_scores[j].extend(mat[:, j].flatten())
+    global_min = np.zeros(m)
+    global_max = np.zeros(m)
+    for j in range(m):
+        arr = np.array(all_scores[j])
+        global_min[j] = np.min(arr)
+        global_max[j] = np.max(arr)
+    norm_list = []
+    for mat in all_matrices:
+        mat_norm = np.zeros_like(mat)
+        for j in range(m):
+            col = mat[:, j]
+            vmin, vmax = global_min[j], global_max[j]
+            rng = vmax - vmin
+            if rng < 1e-12:
+                rng = 1.0
+            mat_norm[:, j] = 2.0 * (col - vmin) / rng - 1.0
+        norm_list.append(np.nan_to_num(mat_norm, nan=0.0, posinf=1.0, neginf=-1.0))
+    return norm_list
+
+
+def tie_breaking_accuracy(scores, labels):
+    best = np.max(scores)
+    tied = np.where(np.abs(scores - best) < 1e-6)[0]
+    return np.mean(labels[tied])
+
+
+# ============================================================================
+# 运行 Baseline（仅 Pass@1 和 Naive Ensemble）
+# ============================================================================
+def run_baseline(parquet_path, dataset_name):
+    print("\n" + "=" * 80)
+    print(f"Baseline on {dataset_name} (Pass@1 and Naive Ensemble)")
+    print("=" * 80)
+
+    df = pd.read_parquet(parquet_path)
+    verifier_cols = [c for c in df.columns if c.endswith('_scores')]
+    m = len(verifier_cols)
+    print(f"Found {m} verifiers: {verifier_cols}")
+
+    # 提取每个问题的原始分数矩阵和标签
+    raw_matrices = []
+    all_labels = []
+    for _, row in df.iterrows():
+        labels = flatten_to_float_list(row['is_correct'])
+        labels = np.array([bool(x) for x in labels], dtype=bool)
+        if len(labels) == 0:
+            continue
+        n = len(labels)
+        mat = np.zeros((n, m))
+        for j, col in enumerate(verifier_cols):
+            scores = flatten_to_float_list(row[col])
+            for i in range(min(n, len(scores))):
+                mat[i, j] = scores[i]
+        raw_matrices.append(mat)
+        all_labels.append(labels)
+
+    print(f"Loaded {len(raw_matrices)} questions (after removing empty ones)")
+
+    # 全局归一化
+    norm_matrices = global_minmax_normalize(raw_matrices)
+    total_qs = len(norm_matrices)
+
+    pass1_correct = 0.0
+    naive_correct = 0.0
+
+    for V, labels in zip(norm_matrices, all_labels):
+        # Pass@1: 第一个响应的正确性
+        pass1_correct += labels[0] if len(labels) > 0 else 0.0
+        # Naive Ensemble: 等权平均
+        naive_scores = np.mean(V, axis=1)
+        naive_correct += tie_breaking_accuracy(naive_scores, labels)
+
+    print("\n" + "-" * 80)
+    print(f"Final results on {dataset_name} (total = {total_qs} questions):")
+    print(f"  Pass@1:         {pass1_correct / total_qs * 100:.2f}%")
+    print(f"  Naive Ensemble: {naive_correct / total_qs * 100:.2f}%")
+    print("=" * 80)
+
+
+if __name__ == "__main__":
+    run_baseline('imo_data.parquet', "IMO Shortlist")
